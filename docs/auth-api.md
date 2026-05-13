@@ -1,29 +1,27 @@
-# Auth API
+# auth-api.md
 
-`POST /auth/staff/delivery/dev-login`
+`POST /auth/staff/delivery/dev-login` — no password, dev only.
 
-Request: `{ "staffId": "delivery-staff-1" }`
-
-Response:
-
-```json
-{
-  "accessToken": "jwt-token",
-  "staff": {
-    "staffId": "delivery-staff-1",
-    "role": "DELIVERY",
-    "displayName": null,
-    "phoneNumber": null
-  }
-}
+```
+request:  { staffId: string }
+response: { accessToken, staff: { staffId, role, displayName, phoneNumber } }
 ```
 
-No password (dev-only).
+## Wiring in this app
 
-## Usage
+| Concern | Where |
+|---|---|
+| Call | `api.ts` → `api.staffDevLogin` |
+| Storage | `store.ts` → `useAppStore.setSession`, persisted as `laundry-delivery-web-state` |
+| Header injection | `api.ts` `request()` adds `Authorization: Bearer ${accessToken}` automatically |
+| Logout / 401 | `App.tsx` `handleLogout` clears session + run, `qc.clear()`, step → `login` |
 
-- Store the response in [`useAppStore.setSession`](../src/store.ts) — persisted to localStorage.
-- [`api.ts`](../src/api.ts) attaches `Authorization: Bearer {accessToken}` automatically.
-- On 401: clear session + run, run `qc.clear()`, return to login.
+## Token semantics
 
-Token payload: `subjectType: 'STAFF'`, `staffId`, `staffRole`. Backend `/delivery/*` is guarded by `StaffAuthGuard + @StaffRoles('DELIVERY')` (ADMIN also passes the guard).
+JWT payload includes `subjectType: 'STAFF'`, `staffId`, `staffRole`. Backend `/delivery/*` guard is `StaffAuthGuard + @StaffRoles('DELIVERY')`. ADMIN tokens also pass the role check, but this app never requests one — it only calls the delivery dev-login endpoint.
+
+## What auth does NOT do here
+
+- No refresh token flow. Dev tokens are long-lived.
+- No role-mismatch UI. Wash/pickup tokens injected manually would 403 — that path isn't covered.
+- No per-tab session isolation. localStorage is shared.

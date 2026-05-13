@@ -1,118 +1,90 @@
-# Delivery API
+# delivery-api.md
 
-- Base URL: `http://localhost:3000` · Swagger: `/docs`
-- All endpoints: `StaffAuthGuard` + `@StaffRoles('DELIVERY')`
-- Delivery unit is the **package** (`ItemPackage`). No per-item scan API.
+Backend contract for what this frontend consumes. Authoritative shapes live in Swagger (`http://localhost:3000/docs`). This file is for **what Swagger can't tell you**: which use-case file backs each route, invariants enforced inside the use case, and known gotchas.
 
-## Endpoints
+All endpoints under `StaffAuthGuard + @StaffRoles('DELIVERY')`. ADMIN tokens also pass the guard; the frontend only ever issues DELIVERY tokens.
 
-| Method | Path | Purpose |
+## Endpoint → use-case map
+
+All under `laundry-api/src/modules/delivery/application/use-cases/`.
+
+| Method | Path | Use case |
 |---|---|---|
-| GET | `/delivery/vehicles` | Active vehicle master |
-| GET | `/delivery/runs/me/active` | My ACTIVE run (`null` if none) |
-| POST | `/delivery/runs` | Start run |
-| POST | `/delivery/runs/:runId/close` | Close run |
-| GET | `/delivery/work` | Packages ready to ship (factory-wide, all items `READY_FOR_DELIVERY`) |
-| GET | `/delivery/runs/me/loaded-packages` | Packages on my truck (`DELIVERING`) |
-| GET | `/delivery/packages/:packageId` | Package detail |
-| POST | `/delivery/packages/:packageId/scan-outbound` | Outbound scan |
-| POST | `/delivery/packages/:packageId/handoff` | Handoff |
-| POST | `/delivery/packages/:packageId/handoff-photo` | Handoff photo (upsert, one per package) |
-
----
+| GET | `/delivery/vehicles` | `get-delivery-vehicles` |
+| GET | `/delivery/runs/me/active` | `get-active-run` |
+| POST | `/delivery/runs` | `create-delivery-run` |
+| POST | `/delivery/runs/:runId/close` | `close-delivery-run` |
+| GET | `/delivery/work` | `get-delivery-work` |
+| GET | `/delivery/runs/me/loaded-packages` | `get-loaded-packages` |
+| GET | `/delivery/packages/:packageId` | `get-delivery-package` |
+| POST | `/delivery/packages/:packageId/scan-outbound` | `scan-outbound` |
+| POST | `/delivery/packages/:packageId/handoff` | `handoff-item` (legacy name; operates on packages) |
+| POST | `/delivery/packages/:packageId/handoff-photo` | `record-handoff-photo` |
 
 ## DeliveryPackage payload
 
-Returned by `/delivery/work`, `/delivery/runs/me/loaded-packages`, and `/delivery/packages/:id`.
+`/delivery/work`, `/delivery/runs/me/loaded-packages`, and `/delivery/packages/:id` all return the same `DeliveryPackageView`. **The only difference is which items are included** — the package-level `where` and the items-level `where` are filtered in lockstep, so the response is internally consistent.
 
-```json
-{
-  "packageId": "package-uuid",
-  "orderId": "order-uuid",
-  "address": "Seoul Gangnam-gu Teheran-ro 1",
-  "phoneNumber": "010-1234-5678",
-  "fulfillmentType": "DELIVERY",
-  "fulfillmentOptionCode": "regular_delivery",
-  "pickupDeliveryPlaceCode": "front_door",
-  "pickupDeliveryPlaceText": null,
-  "items": [
-    {
-      "itemId": "order-item-uuid",
-      "tagBarcode": "TAG-0001",
-      "catalogItemCode": "shirt",
-      "displayNameSnapshot": "Shirt",
-      "status": "READY_FOR_DELIVERY"
-    }
-  ],
-  "handoffPhoto": null
-}
-```
-
-`items` filtering:
-- `/work`: only `READY_FOR_DELIVERY`
-- `/loaded-packages`: only `DELIVERING` on my run
-- `/packages/:id`: all items in the package
+| Endpoint | Package-level filter | Items filter |
+|---|---|---|
+| `/work` | has ≥1 item `READY_FOR_DELIVERY` | `status = READY_FOR_DELIVERY` |
+| `/loaded-packages` | has ≥1 item `DELIVERING` + `deliveryRunItem.runId = caller's active run` | same filter |
+| `/packages/:id` | by id | all items in package |
 
 `handoffPhoto`: `null` or `{ id, packageId, url, createdAt, updatedAt }`.
 
----
-
 ## DeliveryRun payload
 
-```json
-{
-  "id": "run-uuid",
-  "staffId": "delivery-staff-1",
-  "vehicleCode": "DELIVERY_VAN_01",
-  "vehicleDisplayName": "Delivery Van 1",
-  "status": "ACTIVE",
-  "createdAt": "2026-05-13T09:00:00.000Z",
-  "closedAt": null
-}
+```
+{ id, staffId, vehicleCode, vehicleDisplayName, status: 'ACTIVE'|'CLOSED', createdAt, closedAt }
 ```
 
----
+`vehicleDisplayName` is denormalized from `delivery_vehicles.display_name` in the repo's `toRunView` — the frontend should not look it up separately.
 
-## POST /delivery/runs
+## Non-obvious invariants
 
-Request: `{ "vehicleCode": "DELIVERY_VAN_01" }`
+### `/delivery/work` excludes in-transit packages by design
+Filter is `where: { items: { some: { status: 'READY_FOR_DELIVERY' } } }` with the items-level filter narrowed to the same status. Once outbound-scanned, items become `DELIVERING` and the package drops off `/work`. **This is why `/loaded-packages` exists.** Earlier attempts to client-filter `/work` for the "in-transit" tab produced an always-empty tab — don't repeat.
 
-- Idempotent when same staff + same vehicle already has an ACTIVE run (returns existing).
-- 409: staff already has another ACTIVE run / vehicle already in use.
-- 404: vehicle inactive or missing.
+### Outbound requires zero `WAITING` billing rows on the order
+`scan-outbound.use-case.ts` calls `repo.countWaitingBillings(orderId)`. Any `billing_request` with `status='WAITING'` — BASE or SUPPLEMENT — blocks the scan with 409 `BillingNotPaidError`. An older implementation gated only BASE and silently let unpaid SUPPLEMENT through; that was fixed. The repository port docstring on `countWaitingBillings` calls this out.
 
-## POST /delivery/packages/:packageId/scan-outbound
+### Outbound infers the run from the caller
+The frontend does not pass `runId` to `scan-outbound`. The use case resolves it via `repo.findActiveRun(actor.actorId)`. If none, 404 `ActiveRunNotFoundError`. Treat that as a redirect signal, not a recoverable error.
 
-No body.
+### Handoff has no billing or photo check on the backend
+`handoff-item.use-case.ts` only validates that every item in the package is `DELIVERING`. Photo presence is enforced **only** by the frontend (`HandoffScreen` disables the button when `pkg.handoffPhoto === null`). If a future test calls handoff directly without a photo, it will succeed.
 
-- 404 `PackageNotFoundError`
-- 404 `ActiveRunNotFoundError`
-- 409 `PackageNotDeliverableError` — at least one item is not `READY_FOR_DELIVERY`
-- 409 `BillingNotPaidError` — `billing_request.type='BASE'` is not `PAID` (SUPPLEMENT is not gated)
+### Handoff photo is upsert by packageId
+`recordHandoffPhoto` does `prisma.deliveryHandoffPhoto.upsert({ where: { packageId } })`. Schema has UNIQUE on `package_id`. Repeat calls replace `url`, bump `updatedAt`, keep `createdAt`. URL format is not enforced — `IsString + IsNotEmpty` only. This was a deliberate switch from order-scoped (1:N) to package-scoped (1:1) in migration `20260513120000_handoff_photo_per_package`.
 
-Response: `{ packageId, orderId, items: [{ itemId, status: 'DELIVERING', location: 'DELIVERING_TRUCK' }] }`
+### Run creation is idempotent on (staff, vehicle)
+Same staff + same vehicle + existing ACTIVE → returns the existing run. Same staff + different vehicle while ACTIVE → 409. Different staff + same vehicle while ACTIVE → 409.
 
-## POST /delivery/packages/:packageId/handoff
+### Run close is unconditional
+No "still has loaded packages" check on the backend. Frontend can warn but the user can always proceed. Audit log captures the close event.
 
-No body.
+### Order status is recomputed at handoff
+After updating items to `FINISHED`, the use case scans all items on the same order:
+- all `FINISHED` → order `FINISHED`
+- some `FINISHED` → order `PARTIAL_FINISHED`
+- neither (shouldn't be reachable) → response falls back to `'PROCESSING'`
 
-- 404 `PackageNotFoundError`
-- 409 `PackageNotHandoffableError` — at least one item is not `DELIVERING`
+### Every status change writes audit logs inside the same transaction
+`scan-outbound` and `handoff` call `auditLogger.logInTransaction(tx, ...)` once per item with `actionType: 'ITEM_SCAN_OUTBOUND'` / `'ITEM_HANDED_OFF'`. New write actions on this module must inject `AuditLogger` (from `ProcessingRouteModule`) and follow the same pattern.
 
-Response: above + `orderStatus`. `FINISHED` when all items finished, `PARTIAL_FINISHED` when some, fallback `PROCESSING`.
+## Errors
 
-Backend does not validate photo presence — the frontend guards this.
+Defined in `…/delivery/domain/delivery.errors.ts`.
 
-## POST /delivery/packages/:packageId/handoff-photo
+| Class | HTTP | Trigger |
+|---|---|---|
+| `PackageNotFoundError` | 404 | packageId not found |
+| `ActiveRunNotFoundError` | 404 | scan-outbound called without ACTIVE run for caller |
+| `DeliveryVehicleNotFoundError` | 404 | createRun on inactive/missing vehicle |
+| `PackageNotDeliverableError` | 409 | scan-outbound when not all items `READY_FOR_DELIVERY` |
+| `PackageNotHandoffableError` | 409 | handoff when not all items `DELIVERING` |
+| `BillingNotPaidError` | 409 | scan-outbound when `countWaitingBillings > 0` |
+| (`ConflictException`) | 409 | createRun staff/vehicle collisions |
 
-Request: `{ "url": "any string" }` (`IsString + IsNotEmpty`, no URL format enforced).
-
-**Upsert** — calling again for the same packageId updates `url` and bumps `updatedAt` only.
-
-Schema: UNIQUE on `delivery_handoff_photos.package_id`.
-
-Response: `{ id, packageId, url, createdAt, updatedAt }`
-
-## POST /delivery/runs/:runId/close
-
-No body. Sets `status: CLOSED`, `closedAt`. Does not block when packages are still on the truck.
+Backend message strings are user-facing — the frontend just displays `ApiError.message`.
